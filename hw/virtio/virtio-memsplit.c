@@ -134,126 +134,6 @@ static uint64_t gpa2hpa(hwaddr gpa, Error **errp) {
     return vtop(hva, errp);
 }
 
-static void init_ram_info(VirtIOMemSplit *ms) {
-    MemoryRegion *mr;
-    MemoryRegion *sub_mr;
-
-    // Walk over system memory and insert valid GPA ranges into 
-    // ms object
-    mr = get_system_memory();
-    QLIST_INIT(&ms->gpa_ranges);
-
-    qemu_log("System memory subregions:\n");
-    QTAILQ_FOREACH(sub_mr, &mr->subregions, subregions_link) {
-        if (strcmp(sub_mr->name, "ram-below-4g") == 0 ||
-            strcmp(sub_mr->name, "ram-above-4g") == 0) {
-            qemu_log("Found %s memory region\n", sub_mr->name);
-
-            hwaddr gpa_start = sub_mr->addr;
-            hwaddr gpa_end   = gpa_start + sub_mr->size - 1;
-            qemu_log("Subregion gpa range: 0x%lx - 0x%lx\n", gpa_start, gpa_end + 1);
-
-            GPARange *gpa_range = malloc(sizeof(GPARange));
-            gpa_range->start = gpa_start;
-            gpa_range->size = sub_mr->size;
-
-            QLIST_INSERT_HEAD(&ms->gpa_ranges, gpa_range, next);
-
-            uint8_t *hva = memory_region_get_ram_ptr(sub_mr);
-            qemu_log("Subregion hva range: %p - %p\n", hva, hva + sub_mr->size);
-
-            if (ms->hva_ram_start_ptr == NULL || ms->hva_ram_start_ptr > hva) {
-                ms->hva_ram_start_ptr = hva;
-            }
-            ms->hva_ram_size += sub_mr->size;
-        }
-    }
-}
-
-static void virtio_memsplit_handle_gpa_req(struct VirtIOMemSplitReq *req) 
-{
-    VirtIOMemSplit *s = req->dev;
-    VirtIODevice *vdev = VIRTIO_DEVICE(s);
-    int i;
-    int fd;
-    char f_path[128];
-    Error *errp = NULL;
-
-    if (req->elem.out_num > 0) {
-        struct VirtIOSendGpaData *buf = req->elem.out_sg[0].iov_base;
-        get_gpa_log_file_path(buf->timestamp_ns, f_path);
-        fd = open(f_path,
-            O_WRONLY | O_CREAT | O_TRUNC,
-            S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
-        for (i = 0; i < 128 && buf->pfns[i] > 0; i++) {
-            uint64_t gpa = buf->pfns[i] << PAGE_BITS;
-            uint64_t hva = (uint64_t) gpa2hva(gpa, 1, &errp);
-            if (write(fd, &gpa, sizeof(gpa)) < 0) {
-                qemu_log("failed to write GPA\n");
-                goto cleanup;
-            }
-            if (write(fd, &hva, sizeof(hva)) < 0) {
-                qemu_log("failed to write HVA\n");
-                goto cleanup;
-            }
-        }
-        close(fd);
-    }
-
-cleanup:
-    virtqueue_push(req->vq, &req->elem, 128 * (sizeof *req));
-    virtio_notify(vdev, req->vq);
-  
-    virtio_memsplit_free_request(req);
-}
-
-static void virtio_memsplit_handle_migration_req(struct VirtIOMemSplitReq *req) 
-{
-    VirtIOMemSplit *s = req->dev;
-    VirtIODevice *vdev = VIRTIO_DEVICE(s);
-    int i;
-
-    if (req->elem.in_num > 0) {
-        struct VirtIOReceiveMigrationData *buf = req->elem.in_sg[0].iov_base;
-        for (i = 0; i < 128; i++) {
-            buf->gpas[i] = i << 12;
-            buf->nodes[i] = 1;
-        }
-    }
-
-    virtqueue_push(req->vq, &req->elem, 128 * (sizeof *req));
-    virtio_notify(vdev, req->vq);
-  
-    virtio_memsplit_free_request(req);
-}
-
-static void virtio_memsplit_handle_gpa(VirtIODevice *vdev, VirtQueue *vq)
-{
-    struct VirtIOMemSplitReq *req;
-    VirtIOMemSplit *ms = (VirtIOMemSplit *)vdev;
-
-    while((req = virtio_memsplit_get_request(ms, vq))) {
-        virtio_memsplit_handle_gpa_req(req);
-    }
-}
-
-static void virtio_memsplit_handle_migration(VirtIODevice *vdev, VirtQueue *vq)
-{
-    struct VirtIOMemSplitReq *req;
-    VirtIOMemSplit *ms = (VirtIOMemSplit *)vdev;
-
-    while((req = virtio_memsplit_get_request(ms, vq))) {
-        virtio_memsplit_handle_migration_req(req);
-    }
-}
-
-static uint64_t virtio_memsplit_get_features(VirtIODevice *vdev, uint64_t features, 
-                                        Error **errp) 
-{
-    qemu_log("virtio memsplit get features\n");
-    return features;
-}
-
 static ssize_t read_sysfs_file(const char *path, char *buf, size_t bufsize)
 {
     int fd;
@@ -415,6 +295,149 @@ static bool start_tracking(void) {
     return true;
 }
 
+static void init_ram_info(VirtIOMemSplit *ms) {
+    MemoryRegion *mr;
+    MemoryRegion *sub_mr;
+
+    // Walk over system memory and insert valid GPA ranges into 
+    // ms object
+    mr = get_system_memory();
+    QLIST_INIT(&ms->gpa_ranges);
+
+    qemu_log("System memory subregions:\n");
+    QTAILQ_FOREACH(sub_mr, &mr->subregions, subregions_link) {
+        if (strcmp(sub_mr->name, "ram-below-4g") == 0 ||
+            strcmp(sub_mr->name, "ram-above-4g") == 0) {
+            qemu_log("Found %s memory region\n", sub_mr->name);
+
+            hwaddr gpa_start = sub_mr->addr;
+            hwaddr gpa_end   = gpa_start + sub_mr->size - 1;
+            qemu_log("Subregion gpa range: 0x%lx - 0x%lx\n", gpa_start, gpa_end + 1);
+
+            GPARange *gpa_range = malloc(sizeof(GPARange));
+            gpa_range->start = gpa_start;
+            gpa_range->size = sub_mr->size;
+
+            QLIST_INSERT_HEAD(&ms->gpa_ranges, gpa_range, next);
+
+            uint8_t *hva = memory_region_get_ram_ptr(sub_mr);
+            qemu_log("Subregion hva range: %p - %p\n", hva, hva + sub_mr->size);
+
+            if (ms->hva_ram_start_ptr == NULL || ms->hva_ram_start_ptr > hva) {
+                ms->hva_ram_start_ptr = hva;
+            }
+            ms->hva_ram_size += sub_mr->size;
+        }
+    }
+}
+
+static bool init_numa_layout(VirtIOMemSplit *ms) {
+    unsigned long long start_addr = 0, end_addr = 0;
+    size_t num_pages, total_bytes;
+
+    start_addr = get_start_addr();
+    end_addr = get_end_addr();
+
+    if (start_addr >= end_addr) {
+        fprintf(stderr, "Invalid address range!\n");
+        return false;
+    }
+
+    num_pages = (end_addr - start_addr) >> PAGE_BITS;
+    total_bytes = num_pages * sizeof(int);
+
+    ms->numa_layout = malloc(total_bytes);
+    if (!ms->numa_layout) {
+        perror("malloc");
+        return false;
+    }
+    return true;
+}
+
+static void virtio_memsplit_handle_gpa_req(struct VirtIOMemSplitReq *req) 
+{
+    VirtIOMemSplit *s = req->dev;
+    VirtIODevice *vdev = VIRTIO_DEVICE(s);
+    int i;
+    int fd;
+    char f_path[128];
+    Error *errp = NULL;
+
+    if (req->elem.out_num > 0) {
+        struct VirtIOSendGpaData *buf = req->elem.out_sg[0].iov_base;
+        get_gpa_log_file_path(buf->timestamp_ns, f_path);
+        fd = open(f_path,
+            O_WRONLY | O_CREAT | O_TRUNC,
+            S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
+        for (i = 0; i < 128 && buf->pfns[i] > 0; i++) {
+            uint64_t gpa = buf->pfns[i] << PAGE_BITS;
+            uint64_t hva = (uint64_t) gpa2hva(gpa, 1, &errp);
+            if (write(fd, &gpa, sizeof(gpa)) < 0) {
+                qemu_log("failed to write GPA\n");
+                goto cleanup;
+            }
+            if (write(fd, &hva, sizeof(hva)) < 0) {
+                qemu_log("failed to write HVA\n");
+                goto cleanup;
+            }
+        }
+        close(fd);
+    }
+
+cleanup:
+    virtqueue_push(req->vq, &req->elem, 128 * (sizeof *req));
+    virtio_notify(vdev, req->vq);
+  
+    virtio_memsplit_free_request(req);
+}
+
+static void virtio_memsplit_handle_migration_req(struct VirtIOMemSplitReq *req) 
+{
+    VirtIOMemSplit *s = req->dev;
+    VirtIODevice *vdev = VIRTIO_DEVICE(s);
+    int i;
+
+    if (req->elem.in_num > 0) {
+        struct VirtIOReceiveMigrationData *buf = req->elem.in_sg[0].iov_base;
+        for (i = 0; i < 128; i++) {
+            buf->gpas[i] = i << 12;
+            buf->nodes[i] = 1;
+        }
+    }
+
+    virtqueue_push(req->vq, &req->elem, 128 * (sizeof *req));
+    virtio_notify(vdev, req->vq);
+  
+    virtio_memsplit_free_request(req);
+}
+
+static void virtio_memsplit_handle_gpa(VirtIODevice *vdev, VirtQueue *vq)
+{
+    struct VirtIOMemSplitReq *req;
+    VirtIOMemSplit *ms = (VirtIOMemSplit *)vdev;
+
+    while((req = virtio_memsplit_get_request(ms, vq))) {
+        virtio_memsplit_handle_gpa_req(req);
+    }
+}
+
+static void virtio_memsplit_handle_migration(VirtIODevice *vdev, VirtQueue *vq)
+{
+    struct VirtIOMemSplitReq *req;
+    VirtIOMemSplit *ms = (VirtIOMemSplit *)vdev;
+
+    while((req = virtio_memsplit_get_request(ms, vq))) {
+        virtio_memsplit_handle_migration_req(req);
+    }
+}
+
+static uint64_t virtio_memsplit_get_features(VirtIODevice *vdev, uint64_t features, 
+                                        Error **errp) 
+{
+    qemu_log("virtio memsplit get features\n");
+    return features;
+}
+
 static bool build_gfn_map(VirtIOMemSplit *ms) {
     unsigned long long start_addr = 0, end_addr = 0;
     size_t num_pages, total_bytes;
@@ -463,25 +486,19 @@ static bool build_gfn_map(VirtIOMemSplit *ms) {
     return true;
 }
 
-static void virtio_memsplit_migration_timer_callback(void *opaque)
+static int virtio_memsplit_update_numa_layout(struct VirtIOMemSplit *ms)
 {
     unsigned long long start_addr = 0, end_addr = 0;
     int fd;
     size_t bytes_read = 0;
     size_t num_pages, total_bytes;
-    int *node_ids = NULL;
-    struct VirtIOMemSplit *ms = opaque;
-    int64_t now_ms, next_fire_ms;
-
     start_addr = get_start_addr();
     end_addr = get_end_addr();
-
-    qemu_log("start_addr = 0x%llx, end_addr = 0x%llx\n",
-           start_addr, end_addr);
+    int i;
 
     if (start_addr >= end_addr) {
         fprintf(stderr, "Invalid address range!\n");
-        return;
+        return false;
     }
 
     num_pages = (end_addr - start_addr) >> PAGE_BITS;
@@ -491,27 +508,18 @@ static void virtio_memsplit_migration_timer_callback(void *opaque)
     fd = open(PAGE_PLACEMENT, O_RDONLY);
     if (fd < 0) {
         perror("open page_placement");
-        return;
-    }
-
-    /* Allocate space to read all the int entries. */
-    node_ids = malloc(total_bytes);
-    if (!node_ids) {
-        perror("malloc");
-        close(fd);
-        return;
+        return false;
     }
 
     /* We'll do a single read. If partial, read in a loop. */
     while (bytes_read < total_bytes) {
         ssize_t ret = read(fd,
-                           (char *)node_ids + bytes_read,
+                           (char *)ms->numa_layout + bytes_read,
                            total_bytes - bytes_read);
         if (ret < 0) {
             perror("read");
-            free(node_ids);
             close(fd);
-            return;
+            return false;
         }
         if (ret == 0) {
             /* EOF reached earlier than expected */
@@ -524,12 +532,22 @@ static void virtio_memsplit_migration_timer_callback(void *opaque)
 
     close(fd);
 
+    return true;
+}
+
+static void virtio_memsplit_migration_timer_callback(void *opaque)
+{
+    struct VirtIOMemSplit *ms = opaque;
+    int64_t now_ms, next_fire_ms;
+
+    if (!virtio_memsplit_update_numa_layout(ms)) {
+        qemu_log("Failed to update NUMA layout\n");
+    }
+
     now_ms = qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL);
     next_fire_ms = now_ms + 1000; // 1 second from now
     timer_mod(ms->migration_timer, next_fire_ms);
 
-    /* Cleanup */
-    free(node_ids);
     return;
 }
 
@@ -565,6 +583,11 @@ static void virtio_memsplit_realize(DeviceState *dev, Error **errp)
 
     if (!start_tracking()) {
         error_setg(errp, "Failed to start tracking\n");
+        return;
+    }
+
+    if (!init_numa_layout(ms)) {
+        error_setg(errp, "Failed to initialize NUMA layout\n");
         return;
     }
 

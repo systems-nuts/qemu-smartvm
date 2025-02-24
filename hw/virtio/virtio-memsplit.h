@@ -37,6 +37,7 @@ struct VirtIOMemSplit {
     uint64_t hva_ram_size;
     QLIST_HEAD(, GPARange) gpa_ranges;
     uint64_t *gpas;  // page to GPA mapping
+    int32_t *numa_layout;
 };
 
 struct VirtIOMemSplitReq {

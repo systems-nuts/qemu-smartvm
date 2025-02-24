@@ -18,12 +18,13 @@
 #define PAGE_SIZE        (1 << PAGE_BITS)
 #define PAGE_OFFSET_MASK (PAGE_SIZE - 1) 
 
-#define SYSFS_BASE          "/sys/kernel/pvm_migration"
-#define START_ADDR_FILE     SYSFS_BASE "/start_addr"
-#define END_ADDR_FILE       SYSFS_BASE "/end_addr"
-#define PAGE_PLACEMENT      SYSFS_BASE "/page_placement"
-#define PID_FILE            SYSFS_BASE "/pid"
-#define TRACKING_STATE_FILE SYSFS_BASE "/state" 
+#define SYSFS_BASE            "/sys/kernel/pvm_migration"
+#define START_ADDR_FILE       SYSFS_BASE "/start_addr"
+#define END_ADDR_FILE         SYSFS_BASE "/end_addr"
+#define PAGE_PLACEMENT        SYSFS_BASE "/page_placement"
+#define PID_FILE              SYSFS_BASE "/pid"
+#define TRACKING_STATE_FILE   SYSFS_BASE "/state" 
+#define HVA_TO_GPA_TABLE_FILE SYSFS_BASE "/hva_to_gpa_table"
 
 static const VMStateDescription vmstate_virtio_memsplit = {
     .name = "virtio-memsplit",
@@ -414,6 +415,54 @@ static bool start_tracking(void) {
     return true;
 }
 
+static bool build_gfn_map(VirtIOMemSplit *ms) {
+    unsigned long long start_addr = 0, end_addr = 0;
+    size_t num_pages, total_bytes;
+    size_t bytes_read = 0;
+    int fd;
+
+    fd = open(HVA_TO_GPA_TABLE_FILE, O_RDONLY);
+    if (fd < 0) {
+        perror("open page_placement");
+        return false;
+    }
+
+    start_addr = get_start_addr();
+    end_addr = get_end_addr();
+
+    if (start_addr >= end_addr) {
+        fprintf(stderr, "Invalid address range!\n");
+        return false;
+    }
+
+    num_pages = (end_addr - start_addr) >> PAGE_BITS;
+    total_bytes = num_pages * sizeof(uint64_t);
+
+    ms->gpas = malloc(total_bytes);
+
+    while (bytes_read < total_bytes) {
+        ssize_t ret = read(fd, 
+            (char*)ms->gpas + bytes_read, 
+            total_bytes - bytes_read);
+        if (ret < 0) {
+            perror("read");
+            free(ms->gpas);
+            close(fd);
+            return false;
+        }
+        if (ret == 0) {
+            printf("EOF reached: read %zu of %zu bytes\n",
+                bytes_read, total_bytes);
+            break;
+        }
+        bytes_read += (size_t) ret;
+    }
+
+    close(fd);
+
+    return true;
+}
+
 static void virtio_memsplit_migration_timer_callback(void *opaque)
 {
     unsigned long long start_addr = 0, end_addr = 0;
@@ -472,15 +521,8 @@ static void virtio_memsplit_migration_timer_callback(void *opaque)
         }
         bytes_read += (size_t)ret;
     }
-    printf("Read %zu bytes.\n", bytes_read);
 
     close(fd);
-
-    /* 5) Print out the NUMA nodes. */
-    printf("NUMA layout:\n");
-    for (size_t i = 0; i < num_pages; i++) {
-        printf("  Page offset 0x%llx => Node %d\n", start_addr + (i << 12), node_ids[i]);
-    }
 
     now_ms = qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL);
     next_fire_ms = now_ms + 1000; // 1 second from now
@@ -548,6 +590,11 @@ static void virtio_memsplit_realize(DeviceState *dev, Error **errp)
     ret = event_notifier_init(&ms->irqfd, 0);
     if (ret) {
         error_setg(errp, "Failed to initialize event notifier");
+        return;
+    }
+
+    if (!build_gfn_map(ms)) {
+        error_setg(errp, "Could not build HVA -> GPA table\n");
         return;
     }
 

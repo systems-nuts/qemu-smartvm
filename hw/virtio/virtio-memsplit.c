@@ -13,6 +13,7 @@
 #include "virtio-memsplit.h"
 
 #define QUEUE_SIZE 16
+#define TRANSFER_END_TOKEN ~0ULL
 
 #define PAGE_BITS        12
 #define PAGE_SIZE        (1 << PAGE_BITS)
@@ -25,6 +26,7 @@
 #define PID_FILE              SYSFS_BASE "/pid"
 #define TRACKING_STATE_FILE   SYSFS_BASE "/state" 
 #define HVA_TO_GPA_TABLE_FILE SYSFS_BASE "/hva_to_gpa_table"
+#define MIGRATION_MODE_FILE   SYSFS_BASE "/migration_mode"
 
 static const VMStateDescription vmstate_virtio_memsplit = {
     .name = "virtio-memsplit",
@@ -282,18 +284,31 @@ static bool stop_tracking(void) {
     return true;
 }
 
-static bool start_tracking(void) {
+static bool set_migration_mode(int mode) {
     char buf[64];
 
-    sprintf(buf, "%d", 1);
+    sprintf(buf, "%d", mode);
 
-    if (write_sysfs_file(TRACKING_STATE_FILE, buf, sizeof(buf)) < 0) {
-        fprintf(stderr, "Failed to write %s\n", TRACKING_STATE_FILE);
+    if (write_sysfs_file(MIGRATION_MODE_FILE, buf, sizeof(buf)) < 0) {
+        fprintf(stderr, "Failed to write %s\n", MIGRATION_MODE_FILE);
         return false;
     }
 
     return true;
 }
+
+// static bool start_tracking(void) {
+//     char buf[64];
+
+//     sprintf(buf, "%d", 1);
+
+//     if (write_sysfs_file(TRACKING_STATE_FILE, buf, sizeof(buf)) < 0) {
+//         fprintf(stderr, "Failed to write %s\n", TRACKING_STATE_FILE);
+//         return false;
+//     }
+
+//     return true;
+// }
 
 static void init_ram_info(VirtIOMemSplit *ms) {
     MemoryRegion *mr;
@@ -331,28 +346,28 @@ static void init_ram_info(VirtIOMemSplit *ms) {
     }
 }
 
-static bool init_numa_layout(VirtIOMemSplit *ms) {
-    unsigned long long start_addr = 0, end_addr = 0;
-    size_t num_pages, total_bytes;
+// static bool init_numa_layout(VirtIOMemSplit *ms) {
+//     unsigned long long start_addr = 0, end_addr = 0;
+//     size_t num_pages, total_bytes;
 
-    start_addr = get_start_addr();
-    end_addr = get_end_addr();
+//     start_addr = get_start_addr();
+//     end_addr = get_end_addr();
 
-    if (start_addr >= end_addr) {
-        fprintf(stderr, "Invalid address range!\n");
-        return false;
-    }
+//     if (start_addr >= end_addr) {
+//         fprintf(stderr, "Invalid address range!\n");
+//         return false;
+//     }
 
-    num_pages = (end_addr - start_addr) >> PAGE_BITS;
-    total_bytes = num_pages * sizeof(int);
+//     num_pages = (end_addr - start_addr) >> PAGE_BITS;
+//     total_bytes = num_pages * sizeof(int);
 
-    ms->numa_layout = malloc(total_bytes);
-    if (!ms->numa_layout) {
-        perror("malloc");
-        return false;
-    }
-    return true;
-}
+//     ms->numa_layout = malloc(total_bytes);
+//     if (!ms->numa_layout) {
+//         perror("malloc");
+//         return false;
+//     }
+//     return true;
+// }
 
 static void virtio_memsplit_handle_gpa_req(struct VirtIOMemSplitReq *req) 
 {
@@ -395,17 +410,31 @@ static void virtio_memsplit_handle_migration_req(struct VirtIOMemSplitReq *req)
 {
     VirtIOMemSplit *s = req->dev;
     VirtIODevice *vdev = VIRTIO_DEVICE(s);
-    int i;
+    uint64_t i;
+    size_t n_pages = s->hva_ram_size >> PAGE_BITS;
+
+    if (s->pages_left_to_send == 0)
+        s->pages_left_to_send = n_pages;
+    
+    qemu_log("N pages: %lu\n", n_pages);
 
     if (req->elem.in_num > 0) {
         struct VirtIOReceiveMigrationData *buf = req->elem.in_sg[0].iov_base;
-        for (i = 0; i < 128; i++) {
-            buf->gpas[i] = i << 12;
-            buf->nodes[i] = 1;
+        
+        for (i = 0; i < VIRTIO_MEMSPLIT_RECEIVE_MIGRATE_GPA_CAPACITY && s->pages_left_to_send > 0; i++) {
+            buf->gpas[i] = s->gpas[s->pages_left_to_send - 1];
+            buf->nodes[i] = s->numa_layout[s->pages_left_to_send - 1];
+            s->pages_left_to_send--;
         }
+
+        for (; i < VIRTIO_MEMSPLIT_RECEIVE_MIGRATE_GPA_CAPACITY; i++) {
+            buf->gpas[i] = 0ULL;
+            buf->nodes[i] = -1;
+        }
+        buf->pages_left_to_send = s->pages_left_to_send;
     }
 
-    virtqueue_push(req->vq, &req->elem, 128 * (sizeof *req));
+    virtqueue_push(req->vq, &req->elem, (sizeof *req));
     virtio_notify(vdev, req->vq);
   
     virtio_memsplit_free_request(req);
@@ -438,53 +467,53 @@ static uint64_t virtio_memsplit_get_features(VirtIODevice *vdev, uint64_t featur
     return features;
 }
 
-static bool build_gfn_map(VirtIOMemSplit *ms) {
-    unsigned long long start_addr = 0, end_addr = 0;
-    size_t num_pages, total_bytes;
-    size_t bytes_read = 0;
-    int fd;
+// static bool build_gfn_map(VirtIOMemSplit *ms) {
+//     unsigned long long start_addr = 0, end_addr = 0;
+//     size_t num_pages, total_bytes;
+//     size_t bytes_read = 0;
+//     int fd;
 
-    fd = open(HVA_TO_GPA_TABLE_FILE, O_RDONLY);
-    if (fd < 0) {
-        perror("open page_placement");
-        return false;
-    }
+//     fd = open(HVA_TO_GPA_TABLE_FILE, O_RDONLY);
+//     if (fd < 0) {
+//         perror("open page_placement");
+//         return false;
+//     }
 
-    start_addr = get_start_addr();
-    end_addr = get_end_addr();
+//     start_addr = get_start_addr();
+//     end_addr = get_end_addr();
 
-    if (start_addr >= end_addr) {
-        fprintf(stderr, "Invalid address range!\n");
-        return false;
-    }
+//     if (start_addr >= end_addr) {
+//         fprintf(stderr, "Invalid address range!\n");
+//         return false;
+//     }
 
-    num_pages = (end_addr - start_addr) >> PAGE_BITS;
-    total_bytes = num_pages * sizeof(uint64_t);
+//     num_pages = (end_addr - start_addr) >> PAGE_BITS;
+//     total_bytes = num_pages * sizeof(uint64_t);
 
-    ms->gpas = malloc(total_bytes);
+//     ms->gpas = malloc(total_bytes);
 
-    while (bytes_read < total_bytes) {
-        ssize_t ret = read(fd, 
-            (char*)ms->gpas + bytes_read, 
-            total_bytes - bytes_read);
-        if (ret < 0) {
-            perror("read");
-            free(ms->gpas);
-            close(fd);
-            return false;
-        }
-        if (ret == 0) {
-            printf("EOF reached: read %zu of %zu bytes\n",
-                bytes_read, total_bytes);
-            break;
-        }
-        bytes_read += (size_t) ret;
-    }
+//     while (bytes_read < total_bytes) {
+//         ssize_t ret = read(fd, 
+//             (char*)ms->gpas + bytes_read, 
+//             total_bytes - bytes_read);
+//         if (ret < 0) {
+//             perror("read");
+//             free(ms->gpas);
+//             close(fd);
+//             return false;
+//         }
+//         if (ret == 0) {
+//             printf("EOF reached: read %zu of %zu bytes\n",
+//                 bytes_read, total_bytes);
+//             break;
+//         }
+//         bytes_read += (size_t) ret;
+//     }
 
-    close(fd);
+//     close(fd);
 
-    return true;
-}
+//     return true;
+// }
 
 static int virtio_memsplit_update_numa_layout(struct VirtIOMemSplit *ms)
 {
@@ -494,7 +523,6 @@ static int virtio_memsplit_update_numa_layout(struct VirtIOMemSplit *ms)
     size_t num_pages, total_bytes;
     start_addr = get_start_addr();
     end_addr = get_end_addr();
-    int i;
 
     if (start_addr >= end_addr) {
         fprintf(stderr, "Invalid address range!\n");
@@ -581,15 +609,20 @@ static void virtio_memsplit_realize(DeviceState *dev, Error **errp)
         return;
     }
 
-    if (!start_tracking()) {
-        error_setg(errp, "Failed to start tracking\n");
+    if (!set_migration_mode(1)) {  // Manual
+        error_setg(errp, "Could not set migration mode\n");
         return;
     }
 
-    if (!init_numa_layout(ms)) {
-        error_setg(errp, "Failed to initialize NUMA layout\n");
-        return;
-    }
+    // if (!start_tracking()) {
+    //     error_setg(errp, "Failed to start tracking\n");
+    //     return;
+    // }
+
+    // if (!init_numa_layout(ms)) {
+    //     error_setg(errp, "Failed to initialize NUMA layout\n");
+    //     return;
+    // }
 
     // Test mappings
     qemu_log("gpa sectors:\n");
@@ -616,14 +649,15 @@ static void virtio_memsplit_realize(DeviceState *dev, Error **errp)
         return;
     }
 
-    if (!build_gfn_map(ms)) {
-        error_setg(errp, "Could not build HVA -> GPA table\n");
-        return;
-    }
+    // if (!build_gfn_map(ms)) {
+    //     error_setg(errp, "Could not build HVA -> GPA table\n");
+    //     return;
+    // }
 
     virtio_init(vdev, VIRTIO_ID_MEMSPLIT, 0);
     ms->gpa_vq = virtio_add_queue(vdev, QUEUE_SIZE, virtio_memsplit_handle_gpa);
     ms->migration_vq = virtio_add_queue(vdev, QUEUE_SIZE, virtio_memsplit_handle_migration);
+    ms->pages_left_to_send = 0;
 
     ms->migration_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL, virtio_memsplit_migration_timer_callback, ms);
     int64_t now_ms = qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL);

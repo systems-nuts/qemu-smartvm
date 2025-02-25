@@ -20,13 +20,19 @@
 #define PAGE_OFFSET_MASK (PAGE_SIZE - 1) 
 
 #define SYSFS_BASE            "/sys/kernel/pvm_migration"
-#define START_ADDR_FILE       SYSFS_BASE "/start_addr"
-#define END_ADDR_FILE         SYSFS_BASE "/end_addr"
-#define PAGE_PLACEMENT        SYSFS_BASE "/page_placement"
-#define PID_FILE              SYSFS_BASE "/pid"
-#define TRACKING_STATE_FILE   SYSFS_BASE "/state" 
-#define HVA_TO_GPA_TABLE_FILE SYSFS_BASE "/hva_to_gpa_table"
-#define MIGRATION_MODE_FILE   SYSFS_BASE "/migration_mode"
+#define START_ADDR_FILE       SYSFS_BASE  "/start_addr"
+#define END_ADDR_FILE         SYSFS_BASE  "/end_addr"
+#define PAGE_PLACEMENT        SYSFS_BASE  "/page_placement"
+#define PID_FILE              SYSFS_BASE  "/pid"
+#define TRACKING_STATE_FILE   SYSFS_BASE  "/state" 
+#define HVA_TO_GPA_TABLE_FILE SYSFS_BASE  "/hva_to_gpa_table"
+#define MIGRATION_MODE_FILE   SYSFS_BASE  "/migration_mode"
+#define INIT_SECTORS_FILE     SYSFS_BASE  "/init_sectors"
+#define SECTORS_DIR           SYSFS_BASE  "/sectors"
+#define N_SECTORS_FILE        SECTORS_DIR "/n_sectors"
+
+#define NODE_ID_LOCAL  0
+#define NODE_ID_REMOTE 1
 
 static const VMStateDescription vmstate_virtio_memsplit = {
     .name = "virtio-memsplit",
@@ -181,37 +187,37 @@ static ssize_t write_sysfs_file(const char *path, const char *buf, size_t bufsiz
     return ret;
 }
 
-static unsigned long long get_start_addr(void) {
-    char buf[64];
-    ssize_t nread;
-    unsigned long long start_addr;
+// static unsigned long long get_start_addr(void) {
+//     char buf[64];
+//     ssize_t nread;
+//     unsigned long long start_addr;
 
-    nread = read_sysfs_file(START_ADDR_FILE, buf, sizeof(buf));
-    if (nread < 0) {
-        fprintf(stderr, "Failed to read %s\n", START_ADDR_FILE);
-        return 0;
-    }
+//     nread = read_sysfs_file(START_ADDR_FILE, buf, sizeof(buf));
+//     if (nread < 0) {
+//         fprintf(stderr, "Failed to read %s\n", START_ADDR_FILE);
+//         return 0;
+//     }
 
-    sscanf(buf, "%llx", &start_addr);
+//     sscanf(buf, "%llx", &start_addr);
 
-    return start_addr;
-}
+//     return start_addr;
+// }
 
-static unsigned long long get_end_addr(void) {
-    char buf[64];
-    ssize_t nread;
-    unsigned long long end_addr;
+// static unsigned long long get_end_addr(void) {
+//     char buf[64];
+//     ssize_t nread;
+//     unsigned long long end_addr;
 
-    nread = read_sysfs_file(END_ADDR_FILE, buf, sizeof(buf));
-    if (nread < 0) {
-        fprintf(stderr, "Failed to read %s\n", END_ADDR_FILE);
-        return 0;
-    }
+//     nread = read_sysfs_file(END_ADDR_FILE, buf, sizeof(buf));
+//     if (nread < 0) {
+//         fprintf(stderr, "Failed to read %s\n", END_ADDR_FILE);
+//         return 0;
+//     }
 
-    sscanf(buf, "%llx", &end_addr);
+//     sscanf(buf, "%llx", &end_addr);
 
-    return end_addr;
-}
+//     return end_addr;
+// }
 
 static bool set_tracked_addr_range(unsigned long long start, unsigned long long end) {
     char buf[64];
@@ -297,6 +303,36 @@ static bool set_migration_mode(int mode) {
     return true;
 }
 
+static bool init_sectors(void) {
+    char buf[64];
+
+    sprintf(buf, "%d", 1);
+    if (write_sysfs_file(INIT_SECTORS_FILE, buf, sizeof(buf)) < 0) {
+        fprintf(stderr, "Failed to write %s\n", INIT_SECTORS_FILE);
+        return false;
+    }
+    
+    return true;
+}
+
+static int get_n_sectors(void) {
+    char buf[64];
+    int n_sectors;
+    int err;
+
+    if ((err = read_sysfs_file(N_SECTORS_FILE, buf, sizeof(buf))) < 0) {
+        fprintf(stderr, "Failed to read %s\n", N_SECTORS_FILE);
+        return err;
+    }
+
+    if ((err = sscanf(buf, "%d\n", &n_sectors)) < 0) {
+        fprintf(stderr, "Failed to parse %s\n", N_SECTORS_FILE);
+        return err;
+    }
+
+    return n_sectors;
+}
+
 // static bool start_tracking(void) {
 //     char buf[64];
 
@@ -346,28 +382,78 @@ static void init_ram_info(VirtIOMemSplit *ms) {
     }
 }
 
-// static bool init_numa_layout(VirtIOMemSplit *ms) {
-//     unsigned long long start_addr = 0, end_addr = 0;
-//     size_t num_pages, total_bytes;
+static bool move_sectors_to_local(struct VirtIOMemSplit *ms) {  
+    int i;
+    for (i = 0; i < ms->n_sectors; i++) {
+        char buf[64];
+        char node_id_path[128];
 
-//     start_addr = get_start_addr();
-//     end_addr = get_end_addr();
+        sprintf(node_id_path, "%s/%d/node_id", SECTORS_DIR, i);
+        sprintf(buf, "%d", NODE_ID_LOCAL);
 
-//     if (start_addr >= end_addr) {
-//         fprintf(stderr, "Invalid address range!\n");
-//         return false;
-//     }
+        if (write_sysfs_file(node_id_path, buf, sizeof(buf)) < 0) {
+            fprintf(stderr, "Failed to write to %s\n", node_id_path);
+            return false;
+        }
+    }
+    return true;
+}
 
-//     num_pages = (end_addr - start_addr) >> PAGE_BITS;
-//     total_bytes = num_pages * sizeof(int);
+static bool virtio_memsplit_update_numa_layout(struct VirtIOMemSplit *ms)
+{    
+    char buf[64];
+    char sector_numa_id_path[128];
+    char sector_gpa_path[128];
+    int i;
 
-//     ms->numa_layout = malloc(total_bytes);
-//     if (!ms->numa_layout) {
-//         perror("malloc");
-//         return false;
-//     }
-//     return true;
-// }
+    for (i = 0; i < ms->n_sectors; i++) {
+        sprintf(sector_numa_id_path, "%s/%d/node_id", SECTORS_DIR, i);
+        sprintf(sector_gpa_path, "%s/%d/gpa", SECTORS_DIR, i);
+
+        if (read_sysfs_file(sector_numa_id_path, buf, sizeof(buf)) < 0) 
+            return false;
+        
+        if (sscanf(buf, "%d", &ms->numa_ids[i]) < 0)
+            return false;
+        
+        memset(buf, 0, sizeof(buf));
+
+        if (read_sysfs_file(sector_gpa_path, buf, sizeof(buf)) < 0)
+            return false;
+        
+        if (sscanf(buf, "0x%lx", &ms->gpas[i]) < 0)
+            return false;
+        
+        memset(buf, 0, sizeof(buf));
+    }
+
+    return true;
+}
+
+static bool init_numa_layout(VirtIOMemSplit *ms) {
+    int n_sectors = get_n_sectors();
+
+    if (n_sectors < 0) 
+        return false;
+    
+    ms->n_sectors = n_sectors;
+    ms->gpas = malloc(n_sectors * sizeof(*ms->gpas));
+    if (!ms->gpas) {
+        perror("malloc");
+        return false;
+    }
+
+    ms->numa_ids = malloc(n_sectors * sizeof(*ms->numa_ids));
+    if (!ms->numa_ids) {
+        perror("malloc");
+        return false;
+    }
+
+    if (!virtio_memsplit_update_numa_layout(ms))
+        return false;
+
+    return true;
+}
 
 static void virtio_memsplit_handle_gpa_req(struct VirtIOMemSplitReq *req) 
 {
@@ -411,19 +497,19 @@ static void virtio_memsplit_handle_migration_req(struct VirtIOMemSplitReq *req)
     VirtIOMemSplit *s = req->dev;
     VirtIODevice *vdev = VIRTIO_DEVICE(s);
     uint64_t i;
-    size_t n_pages = s->hva_ram_size >> PAGE_BITS;
 
-    if (s->pages_left_to_send == 0)
-        s->pages_left_to_send = n_pages;
-    
-    qemu_log("N pages: %lu\n", n_pages);
+    if (s->pages_left_to_send == 0) {  // New transfer
+        s->pages_left_to_send = s->n_sectors;
+        virtio_memsplit_update_numa_layout(s);
+    }
 
     if (req->elem.in_num > 0) {
         struct VirtIOReceiveMigrationData *buf = req->elem.in_sg[0].iov_base;
         
         for (i = 0; i < VIRTIO_MEMSPLIT_RECEIVE_MIGRATE_GPA_CAPACITY && s->pages_left_to_send > 0; i++) {
             buf->gpas[i] = s->gpas[s->pages_left_to_send - 1];
-            buf->nodes[i] = s->numa_layout[s->pages_left_to_send - 1];
+            buf->sizes[i] = VIRTIO_MEMSPLIT_MEM_SECTOR_SIZE;
+            buf->nodes[i] = s->numa_ids[s->pages_left_to_send - 1];
             s->pages_left_to_send--;
         }
 
@@ -465,102 +551,6 @@ static uint64_t virtio_memsplit_get_features(VirtIODevice *vdev, uint64_t featur
 {
     qemu_log("virtio memsplit get features\n");
     return features;
-}
-
-// static bool build_gfn_map(VirtIOMemSplit *ms) {
-//     unsigned long long start_addr = 0, end_addr = 0;
-//     size_t num_pages, total_bytes;
-//     size_t bytes_read = 0;
-//     int fd;
-
-//     fd = open(HVA_TO_GPA_TABLE_FILE, O_RDONLY);
-//     if (fd < 0) {
-//         perror("open page_placement");
-//         return false;
-//     }
-
-//     start_addr = get_start_addr();
-//     end_addr = get_end_addr();
-
-//     if (start_addr >= end_addr) {
-//         fprintf(stderr, "Invalid address range!\n");
-//         return false;
-//     }
-
-//     num_pages = (end_addr - start_addr) >> PAGE_BITS;
-//     total_bytes = num_pages * sizeof(uint64_t);
-
-//     ms->gpas = malloc(total_bytes);
-
-//     while (bytes_read < total_bytes) {
-//         ssize_t ret = read(fd, 
-//             (char*)ms->gpas + bytes_read, 
-//             total_bytes - bytes_read);
-//         if (ret < 0) {
-//             perror("read");
-//             free(ms->gpas);
-//             close(fd);
-//             return false;
-//         }
-//         if (ret == 0) {
-//             printf("EOF reached: read %zu of %zu bytes\n",
-//                 bytes_read, total_bytes);
-//             break;
-//         }
-//         bytes_read += (size_t) ret;
-//     }
-
-//     close(fd);
-
-//     return true;
-// }
-
-static int virtio_memsplit_update_numa_layout(struct VirtIOMemSplit *ms)
-{
-    unsigned long long start_addr = 0, end_addr = 0;
-    int fd;
-    size_t bytes_read = 0;
-    size_t num_pages, total_bytes;
-    start_addr = get_start_addr();
-    end_addr = get_end_addr();
-
-    if (start_addr >= end_addr) {
-        fprintf(stderr, "Invalid address range!\n");
-        return false;
-    }
-
-    num_pages = (end_addr - start_addr) >> PAGE_BITS;
-    total_bytes = num_pages * sizeof(int);
-
-    /* Open the binary file. */
-    fd = open(PAGE_PLACEMENT, O_RDONLY);
-    if (fd < 0) {
-        perror("open page_placement");
-        return false;
-    }
-
-    /* We'll do a single read. If partial, read in a loop. */
-    while (bytes_read < total_bytes) {
-        ssize_t ret = read(fd,
-                           (char *)ms->numa_layout + bytes_read,
-                           total_bytes - bytes_read);
-        if (ret < 0) {
-            perror("read");
-            close(fd);
-            return false;
-        }
-        if (ret == 0) {
-            /* EOF reached earlier than expected */
-            printf("EOF reached: read %zu of %zu bytes\n",
-                   bytes_read, total_bytes);
-            break;
-        }
-        bytes_read += (size_t)ret;
-    }
-
-    close(fd);
-
-    return true;
 }
 
 static void virtio_memsplit_migration_timer_callback(void *opaque)
@@ -614,15 +604,25 @@ static void virtio_memsplit_realize(DeviceState *dev, Error **errp)
         return;
     }
 
+    if (!init_sectors()) {
+        error_setg(errp, "Could not initialize memory sectors\n");
+        return;
+    }
+
     // if (!start_tracking()) {
     //     error_setg(errp, "Failed to start tracking\n");
     //     return;
     // }
 
-    // if (!init_numa_layout(ms)) {
-    //     error_setg(errp, "Failed to initialize NUMA layout\n");
-    //     return;
-    // }
+    if (!init_numa_layout(ms)) {
+        error_setg(errp, "Failed to initialize NUMA layout\n");
+        return;
+    }
+
+    if (!move_sectors_to_local(ms)) {
+        error_setg(errp, "Failed to migrate pages\n");
+        return;
+    }
 
     // Test mappings
     qemu_log("gpa sectors:\n");
@@ -662,7 +662,9 @@ static void virtio_memsplit_realize(DeviceState *dev, Error **errp)
     ms->migration_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL, virtio_memsplit_migration_timer_callback, ms);
     int64_t now_ms = qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL);
     int64_t first_fire_ms = now_ms + 1000; // 1 second from now
-    timer_mod(ms->migration_timer, first_fire_ms);
+    if (0) {
+        timer_mod(ms->migration_timer, first_fire_ms);
+    }
 
     qemu_log("virtio memsplit realize\n");
 }

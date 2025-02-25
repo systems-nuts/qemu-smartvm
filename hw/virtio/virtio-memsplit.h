@@ -17,7 +17,10 @@
 OBJECT_DECLARE_SIMPLE_TYPE(VirtIOMemSplit, VIRTIO_MEMSPLIT)
 
 #define VIRTIO_MEMSPLIT_SEND_GPA_CAPACITY 128
-#define VIRTIO_MEMSPLIT_RECEIVE_MIGRATE_GPA_CAPACITY 330
+#define VIRTIO_MEMSPLIT_RECEIVE_MIGRATE_GPA_CAPACITY 128
+
+#define VIRTIO_MEMSPLIT_MEM_SECTOR_BITS 27
+#define VIRTIO_MEMSPLIT_MEM_SECTOR_SIZE (1UL << VIRTIO_MEMSPLIT_MEM_SECTOR_BITS)
 
 struct VirtIOMemSplitReq;
 struct GPARange;
@@ -38,8 +41,11 @@ struct VirtIOMemSplit {
     uint8_t *hva_ram_start_ptr;
     uint64_t hva_ram_size;
     QLIST_HEAD(, GPARange) gpa_ranges;
-    uint64_t *gpas;  // page to GPA mapping
-    int32_t *numa_layout;
+
+    // page to GPA mapping
+    uint64_t *gpas;
+    int32_t *numa_ids;
+    int n_sectors;
 };
 
 struct VirtIOMemSplitReq {
@@ -55,6 +61,7 @@ struct VirtIOSendGpaData {
 
 struct VirtIOReceiveMigrationData {
     uint64_t gpas[VIRTIO_MEMSPLIT_RECEIVE_MIGRATE_GPA_CAPACITY];
+    uint64_t sizes[VIRTIO_MEMSPLIT_RECEIVE_MIGRATE_GPA_CAPACITY];
     int32_t nodes[VIRTIO_MEMSPLIT_RECEIVE_MIGRATE_GPA_CAPACITY];
     uint64_t pages_left_to_send;
 };

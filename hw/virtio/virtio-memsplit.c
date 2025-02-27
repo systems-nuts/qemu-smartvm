@@ -150,14 +150,14 @@ static ssize_t read_sysfs_file(const char *path, char *buf, size_t bufsize)
     fd = open(path, O_RDONLY);
     if (fd < 0) {
         perror("open");
-        return -1;
+        return -ENOENT;
     }
 
     ret = read(fd, buf, bufsize - 1);  // leave room for null-terminator
     if (ret < 0) {
         perror("read");
         close(fd);
-        return -2;
+        return -ret;
     }
 
     buf[ret] = '\0'; // null-terminate
@@ -315,6 +315,18 @@ static bool init_sectors(void) {
     return true;
 }
 
+static bool destroy_sectors(void) {
+    char buf[64];
+
+    sprintf(buf, "%d", 0);
+    if (write_sysfs_file(INIT_SECTORS_FILE, buf, sizeof(buf)) < 0) {
+        fprintf(stderr, "Failed to write %s\n", INIT_SECTORS_FILE);
+        return false;
+    }
+    
+    return true;
+}
+
 static int get_n_sectors(void) {
     char buf[64];
     int n_sectors;
@@ -322,7 +334,7 @@ static int get_n_sectors(void) {
 
     if ((err = read_sysfs_file(N_SECTORS_FILE, buf, sizeof(buf))) < 0) {
         fprintf(stderr, "Failed to read %s\n", N_SECTORS_FILE);
-        return err;
+        return 0;
     }
 
     if ((err = sscanf(buf, "%d\n", &n_sectors)) < 0) {
@@ -433,7 +445,7 @@ static bool virtio_memsplit_update_numa_layout(struct VirtIOMemSplit *ms)
 static bool init_numa_layout(VirtIOMemSplit *ms) {
     int n_sectors = get_n_sectors();
 
-    if (n_sectors < 0) 
+    if (n_sectors <= 0) 
         return false;
     
     ms->n_sectors = n_sectors;
@@ -582,7 +594,7 @@ static void virtio_memsplit_realize(DeviceState *dev, Error **errp)
         error_setg(errp, "Could not find guest RAM region(s)");
         return;
     }
-
+    
     if (is_tracking() && !stop_tracking()) {
         error_setg(errp, "Could not stop tracking the previous process\n");
         return;
@@ -601,6 +613,11 @@ static void virtio_memsplit_realize(DeviceState *dev, Error **errp)
 
     if (!set_migration_mode(1)) {  // Manual
         error_setg(errp, "Could not set migration mode\n");
+        return;
+    }
+
+    if (get_n_sectors() > 0 && !destroy_sectors()) {
+        error_setg(errp, "Could not destroy previous sectors\n");
         return;
     }
 

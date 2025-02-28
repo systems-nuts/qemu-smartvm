@@ -235,6 +235,10 @@ typedef struct VirtIOPCIIDInfo {
 
 static const VirtIOPCIIDInfo virtio_pci_id_info[] = {
     {
+        .vdev_id = VIRTIO_ID_NUMA_MIGRATE,
+        .class_id = PCI_CLASS_OTHERS,
+    },
+    {
         .vdev_id = VIRTIO_ID_CRYPTO,
         .class_id = PCI_CLASS_OTHERS,
     }, {

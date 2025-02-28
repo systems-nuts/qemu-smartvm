@@ -68,7 +68,8 @@
 #define VIRTIO_ID_AUDIO_POLICY		39 /* virtio audio policy */
 #define VIRTIO_ID_BT			40 /* virtio bluetooth */
 #define VIRTIO_ID_GPIO			41 /* virtio gpio */
-#define VIRTIO_ID_MEMSPLIT      69
+#define VIRTIO_ID_NUMA_MIGRATE		68 /* virtio numa migration */
+#define VIRTIO_ID_MEMSPLIT              69
 
 /*
  * Virtio Transitional IDs

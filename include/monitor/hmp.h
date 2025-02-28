@@ -179,4 +179,6 @@ void hmp_info_mtree(Monitor *mon, const QDict *qdict);
 void hmp_info_cryptodev(Monitor *mon, const QDict *qdict);
 void hmp_dumpdtb(Monitor *mon, const QDict *qdict);
 
+void hmp_numa_migrate(Monitor *mon, const QDict *qdict);
+
 #endif

@@ -1859,3 +1859,15 @@ SRST
   List event channels in the guest
 ERST
 #endif
+
+    {
+        .name       = "numa_migrate",
+        .args_type  = "gpa:l,size:l,node:i",
+        .params     = "gpa size node",
+        .help       = "Migrate memory region to NUMA node",
+        .cmd        = hmp_numa_migrate,
+    },
+SRST
+``numa_migrate`` *gpa* *size* *node*
+  Migrate memory region starting at *gpa* of size *size* to NUMA node *node*.
+ERST
